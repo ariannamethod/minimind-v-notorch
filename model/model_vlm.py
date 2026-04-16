@@ -267,10 +267,35 @@ class MiniMindVLM(Module):
             vis_proj = _lib.nt_silu(vis_proj)
             vis_proj = _lib.nt_seq_linear(vproj_w2_i, vis_proj, n_vtok)
 
-            # Add vision features to embedding at image marker positions
-            # The vision projector output is added to the hidden states
-            # at positions where image tokens appear
-            h = _lib.nt_add(h, vis_proj)
+            # Read projected vision features from tape
+            tape_ptr = _lib.nt_tape_get()
+            entry_size = ctypes.sizeof(_NtTapeEntry)
+            tape_addr = ctypes.cast(tape_ptr, ctypes.c_void_p).value
+            vp_entry = ctypes.cast(
+                tape_addr + vis_proj * entry_size,
+                ctypes.POINTER(_NtTapeEntry)
+            ).contents
+            vp_tensor = ctypes.cast(vp_entry.output, ctypes.POINTER(_NtTensor)).contents
+            vis_data = [vp_tensor.data[i] for i in range(n_vtok * DIM)]
+
+            # Build a CTX-length tensor with vision features at marker positions only
+            marker = self.config.image_ids[0] if self.config.image_ids else -1
+            padded = [0.0] * (CTX * DIM)
+            if marker >= 0:
+                vi = 0
+                for pos in range(CTX):
+                    if token_ids[pos] == marker and vi < n_vtok:
+                        for d in range(DIM):
+                            padded[pos * DIM + d] = vis_data[vi * DIM + d]
+                        vi += 1
+
+            vis_padded_t = Tensor.zeros(CTX * DIM)
+            vis_padded_t.set_data(padded)
+            vis_padded_idx = _lib.nt_tape_record(vis_padded_t._ptr, 0, -1, -1, ctypes.c_float(0))
+            vis_padded_t._owns = False
+
+            # Add vision features at marker positions to text embeddings
+            h = _lib.nt_add(h, vis_padded_idx)
 
         # Transformer layers
         for l in range(self.config.num_hidden_layers):
@@ -444,7 +469,33 @@ class MiniMindVLM(Module):
                 vis_proj = _lib.nt_seq_linear(vproj_w1_i, vis_idx, n_vtok)
                 vis_proj = _lib.nt_silu(vis_proj)
                 vis_proj = _lib.nt_seq_linear(vproj_w2_i, vis_proj, n_vtok)
-                h = _lib.nt_add(h, vis_proj)
+
+                # Read projected vision features and pad to CTX at marker positions
+                tape_ptr = _lib.nt_tape_get()
+                entry_size = ctypes.sizeof(_NtTapeEntry)
+                tape_addr = ctypes.cast(tape_ptr, ctypes.c_void_p).value
+                vp_entry = ctypes.cast(
+                    tape_addr + vis_proj * entry_size,
+                    ctypes.POINTER(_NtTapeEntry)
+                ).contents
+                vp_tensor = ctypes.cast(vp_entry.output, ctypes.POINTER(_NtTensor)).contents
+                vis_data = [vp_tensor.data[i] for i in range(n_vtok * DIM)]
+
+                marker = self.config.image_ids[0] if self.config.image_ids else -1
+                padded = [0.0] * (CTX * DIM)
+                if marker >= 0:
+                    vi = 0
+                    for pos in range(CTX):
+                        if ctx[pos] == marker and vi < n_vtok:
+                            for d in range(DIM):
+                                padded[pos * DIM + d] = vis_data[vi * DIM + d]
+                            vi += 1
+
+                vis_padded_t = Tensor.zeros(CTX * DIM)
+                vis_padded_t.set_data(padded)
+                vis_padded_idx = _lib.nt_tape_record(vis_padded_t._ptr, 0, -1, -1, ctypes.c_float(0))
+                vis_padded_t._owns = False
+                h = _lib.nt_add(h, vis_padded_idx)
 
             for l in range(self.config.num_hidden_layers):
                 rms1 = tape_ids[pi]; pi += 1

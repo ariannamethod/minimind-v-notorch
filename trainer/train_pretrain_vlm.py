@@ -143,7 +143,7 @@ def main():
     # Load dataset
     if not os.path.exists(args.data_path):
         print(f"dataset not found: {args.data_path}")
-        print("generating synthetic training data for testing...")
+        print("using synthetic random data for testing...")
         dataset = None
     else:
         dataset = load_parquet_dataset(args.data_path)
