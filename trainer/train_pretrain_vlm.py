@@ -1,178 +1,258 @@
+"""
+MiniMind-V VLM pretraining — backed by notorch + Chuck optimizer
+
+No PyTorch. No torch.distributed. No CUDA.
+Just notorch (ctypes to libnotorch) and Chuck.
+
+Trains vision encoder (patch embedding + projector) + text decoder
+on image+text pairs from parquet dataset.
+
+usage:
+    python -m trainer.train_pretrain_vlm                              # train with defaults
+    python -m trainer.train_pretrain_vlm --data_path dataset/i2t.parquet  # custom dataset
+    python -m trainer.train_pretrain_vlm --resume weights/vlm.bin     # resume training
+"""
+
 import os
 import sys
+import time
+import math
+import json
+import random
+import argparse
+import io
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import argparse
-import time
-import warnings
-import torch
-import torch.distributed as dist
-from contextlib import nullcontext
-from torch import optim, nn
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer
 from model.model_vlm import MiniMindVLM, VLMConfig
-from dataset.lm_dataset import VLMDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, init_distributed_mode, setup_seed, init_vlm_model, vlm_checkpoint, SkipBatchSampler, vlm_collate_fn
-
-warnings.filterwarnings('ignore')
+from ariannamethod.notorch_nn import seed as nt_seed
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    start_time = time.time()
-    last_step = start_step
-    for step, (input_ids, labels, pixel_values) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        pixel_values = {k: v.to(args.device) for k, v in pixel_values.items()} if isinstance(pixel_values, dict) else pixel_values.to(args.device)
-        last_step = step
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        with autocast_ctx:
-            res = model(input_ids, labels=labels, pixel_values=pixel_values)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
-
-        scaler.scale(loss).backward()
-
-        if step % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
-
-            optimizer.zero_grad(set_to_none=True)
-
-        if step % args.log_interval == 0 or step == iters:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
-            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
-            current_logits_loss = current_loss - current_aux_loss
-            current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
-
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
-            moe_suffix = '_moe' if vlm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            clean_state_dict = {
-                key: value for key, value in state_dict.items() if not key.startswith('vision_encoder.')
-            }
-            clean_state_dict = {k: v.half().cpu() for k, v in clean_state_dict.items()}  # 半精度保存并移到CPU
-            torch.save(clean_state_dict, ckp)
-            vlm_checkpoint(vlm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
-            model.train()
-            del state_dict, clean_state_dict
-
-        del input_ids, labels, pixel_values, res, loss
-
-    if last_step > start_step and last_step % args.accumulation_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+def load_parquet_dataset(path):
+    """Load image+text pairs from parquet file. Returns list of (conversations, image_bytes)."""
+    import pyarrow.parquet as pq
+    import pyarrow as pa
+    table = pa.Table.from_batches(pq.ParquetFile(path).iter_batches())
+    data = []
+    for i in range(len(table)):
+        conversations = json.loads(table['conversations'][i].as_py())
+        image_bytes = table['image_bytes'][i].as_py()
+        if not isinstance(image_bytes, list):
+            image_bytes = [image_bytes]
+        data.append((conversations, image_bytes))
+    return data
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind-V Pretrain")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='pretrain_vlm', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=3, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=4e-4, help="初始学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=360, type=int, help="训练的最大截断长度")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_i2t.parquet", help="训练数据路径")
-    parser.add_argument('--from_weight', default='llm', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
-    parser.add_argument('--freeze_llm', default=1, type=int, choices=[0, 1, 2], help="冻结策略（0=完全可训练，1=冻结+解冻第0层，2=完全冻结仅训练proj）")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
-    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-V-Pretrain", help="wandb项目名")
+def simple_tokenize(text, vocab_size=6400):
+    """Simple character-level tokenization (fallback when no tokenizer available)."""
+    return [min(ord(c), vocab_size - 1) for c in text]
+
+
+def build_training_pair(conversations, image_token, image_token_len, max_len, tokenizer=None):
+    """
+    Build token_ids and target_ids from conversation data.
+    Returns (token_ids, target_ids) as lists of int.
+    """
+    # Build prompt from conversations
+    image_pad = image_token * image_token_len
+    parts = []
+    for turn in conversations:
+        role = turn.get('role', 'user')
+        content = turn.get('content', '')
+        content = content.replace('<image>', image_pad)
+        parts.append(f"{role}: {content}")
+    text = '\n'.join(parts)
+
+    if tokenizer:
+        token_ids = tokenizer(text).input_ids[:max_len]
+    else:
+        token_ids = simple_tokenize(text, 6400)[:max_len]
+
+    # Pad to max_len
+    pad_id = 0
+    if len(token_ids) < max_len:
+        token_ids += [pad_id] * (max_len - len(token_ids))
+
+    # Target: shifted by 1 (next-token prediction)
+    target_ids = token_ids[1:] + [pad_id]
+
+    return token_ids, target_ids
+
+
+def get_lr(current_step, total_steps, lr, warmup_ratio=0.1):
+    """Cosine schedule with linear warmup."""
+    warmup = int(total_steps * warmup_ratio)
+    min_lr = lr * 0.1
+    if current_step < warmup:
+        return lr * current_step / max(1, warmup)
+    progress = (current_step - warmup) / max(1, total_steps - warmup)
+    return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='MiniMind-V VLM Pretrain (notorch)')
+    parser.add_argument('--data_path', type=str, default='../dataset/pretrain_i2t.parquet')
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--lr', type=float, default=4e-4)
+    parser.add_argument('--hidden_size', type=int, default=512)
+    parser.add_argument('--num_hidden_layers', type=int, default=8)
+    parser.add_argument('--max_seq_len', type=int, default=360)
+    parser.add_argument('--image_size', type=int, default=224)
+    parser.add_argument('--patch_size', type=int, default=16)
+    parser.add_argument('--image_token_len', type=int, default=64)
+    parser.add_argument('--save_every', type=int, default=1000)
+    parser.add_argument('--log_every', type=int, default=100)
+    parser.add_argument('--save_dir', type=str, default='../out')
+    parser.add_argument('--save_weight', type=str, default='pretrain_vlm')
     args = parser.parse_args()
 
-    # ========== 1. 初始化环境和随机种子 ==========
-    local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
-    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
+    print("════════════════════════════════════════════════════════")
+    print("  MiniMind-V — VLM pretraining (Python + libnotorch)")
+    print("  no torch. no transformers. Chuck optimizer.")
+    print("════════════════════════════════════════════════════════")
+
+    # Config
+    vlm_config = VLMConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        max_seq_len=args.max_seq_len,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        image_token_len=args.image_token_len,
+    )
+
+    nt_seed(42)
+    model = MiniMindVLM(vlm_config)
+    n_params = model.count_params()
+    print(f"model: {n_params:,} params (dim={args.hidden_size} L={args.num_hidden_layers})")
+    print(f"vision: {vlm_config.image_size}px, patch={vlm_config.patch_size}, "
+          f"n_patches={vlm_config.n_patches}, tokens={vlm_config.image_token_len}")
+
+    # Load tokenizer if available
+    tokenizer = None
+    tokenizer_path = os.path.join(os.path.dirname(__file__), '..', 'model')
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        print(f"tokenizer: loaded from {tokenizer_path}")
+    except Exception:
+        print("tokenizer: using character-level fallback")
+
+    # Load dataset
+    if not os.path.exists(args.data_path):
+        print(f"dataset not found: {args.data_path}")
+        print("generating synthetic training data for testing...")
+        dataset = None
+    else:
+        dataset = load_parquet_dataset(args.data_path)
+        print(f"dataset: {args.data_path} ({len(dataset)} samples)")
+
+    # Resume
+    start_step = 0
+    start_epoch = 0
+    if args.resume and os.path.exists(args.resume):
+        if model.load_weights(args.resume):
+            print(f"resumed from {args.resume}")
+            meta = args.resume + '.meta'
+            if os.path.exists(meta):
+                with open(meta) as f:
+                    lines = f.readlines()
+                    if len(lines) >= 2:
+                        start_step = int(lines[0].strip())
+                        start_epoch = int(lines[1].strip()) if len(lines) > 1 else 0
+                print(f"  start_epoch={start_epoch}, start_step={start_step}")
+
+    total_steps = (len(dataset) if dataset else 1000) * args.epochs
+    print(f"training: {args.epochs} epochs, lr={args.lr}")
+    print()
+    print("training...")
+    print("─────────────────────────────────────────────────────")
+
+    t0 = time.time()
+    best_loss = 99.0
+    global_step = 0
     os.makedirs(args.save_dir, exist_ok=True)
-    vlm_config = VLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, max_seq_len=args.max_seq_len, use_moe=bool(args.use_moe))
-    ckp_data = vlm_checkpoint(vlm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
-    # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-V-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
-    # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer, preprocess = init_vlm_model(vlm_config, from_weight=args.from_weight, device=args.device, freeze_llm=args.freeze_llm)
-    train_ds = VLMDataset(args.data_path, tokenizer, preprocess=preprocess, image_special_token=vlm_config.image_special_token, image_token_len=vlm_config.image_token_len, max_length=vlm_config.max_seq_len)
-    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
-    
-    # ========== 6. 从ckp恢复状态 ==========
-    start_epoch, start_step = 0, 0
-    if ckp_data:
-        model.load_state_dict(ckp_data['model'], strict=False)
-        optimizer.load_state_dict(ckp_data['optimizer'])
-        scaler.load_state_dict(ckp_data['scaler'])
-        start_epoch = ckp_data['epoch']
-        start_step = ckp_data.get('step', 0)
-    
-    # ========== 7. 编译和分布式包装 ==========
-    if args.use_compile == 1:
-        model = torch.compile(model)
-        Logger('torch.compile enabled')
-    if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
-    
-    # ========== 8. 开始训练 ==========
+
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
-        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
-        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True, collate_fn=vlm_collate_fn)
-        if skip > 0: 
-            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+        if dataset:
+            indices = list(range(len(dataset)))
+            random.seed(42 + epoch)
+            random.shuffle(indices)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
-    
-    # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+            indices = list(range(1000))
+
+        step_in_epoch = 0
+        for idx in indices:
+            if epoch == start_epoch and step_in_epoch < start_step:
+                step_in_epoch += 1
+                global_step += 1
+                continue
+
+            lr = get_lr(global_step, total_steps, args.lr)
+
+            if dataset:
+                conversations, image_bytes_list = dataset[idx]
+                token_ids, target_ids = build_training_pair(
+                    conversations,
+                    vlm_config.image_special_token,
+                    vlm_config.image_token_len,
+                    vlm_config.max_seq_len,
+                    tokenizer
+                )
+
+                # Forward with image
+                loss_idx, loss_val = model.forward_train_vlm(
+                    token_ids, target_ids, image_bytes_list
+                )
+            else:
+                # Synthetic data for testing
+                token_ids = [random.randint(0, 99) for _ in range(vlm_config.max_seq_len)]
+                target_ids = token_ids[1:] + [0]
+                loss_idx, loss_val = model.forward_train(token_ids, target_ids)
+
+            if loss_val < best_loss:
+                best_loss = loss_val
+
+            model.backward_step(loss_idx, loss_val, lr)
+
+            step_in_epoch += 1
+            global_step += 1
+
+            if global_step % args.log_every == 0 or global_step == 1:
+                elapsed = time.time() - t0
+                print(f"  epoch {epoch+1}/{args.epochs} step {step_in_epoch:5d} | "
+                      f"loss {loss_val:.4f} | best {best_loss:.4f} | "
+                      f"lr {lr:.2e} | {elapsed:.1f}s")
+
+            if global_step % args.save_every == 0:
+                save_path = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}.bin'
+                model.save_weights(save_path)
+                with open(save_path + '.meta', 'w') as f:
+                    f.write(f"{step_in_epoch}\n{epoch}\n{best_loss}\n"
+                            f"{vlm_config.hidden_size}\n{vlm_config.num_hidden_layers}\n"
+                            f"{vlm_config.max_seq_len}\n")
+                print(f"  ──── saved checkpoint (step {global_step})")
+
+    elapsed = time.time() - t0
+    print("─────────────────────────────────────────────────────")
+    print(f"  best loss: {best_loss:.4f}")
+    print(f"  time: {elapsed:.0f}s ({elapsed/60:.1f} min)")
+
+    # Save final
+    save_path = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}.bin'
+    model.save_weights(save_path)
+    with open(save_path + '.meta', 'w') as f:
+        f.write(f"{step_in_epoch}\n{epoch}\n{best_loss}\n"
+                f"{vlm_config.hidden_size}\n{vlm_config.num_hidden_layers}\n"
+                f"{vlm_config.max_seq_len}\n")
+
+    print()
+    print("════════════════════════════════════════════════════════")
+    print(f"  MiniMind-V {n_params:,} params. No PyTorch.")
+    print("════════════════════════════════════════════════════════")
+
+
+if __name__ == '__main__':
+    main()
