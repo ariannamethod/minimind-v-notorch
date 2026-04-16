@@ -3,3 +3,9 @@ out
 website/
 docs-minimind-v/
 测试.py
+__pycache__/
+*.pyc
+ariannamethod/libnotorch.so
+ariannamethod/libnotorch.dylib
+ariannamethod/libnotorch_vision.so
+ariannamethod/libnotorch_vision.dylib
