@@ -21,8 +21,7 @@ model/
 │   ├── config.json
 │   ├── model.safetensors           # ~180MB, float16
 │   └── preprocessor_config.json
-├── model_minimind.py               # LLM structure
-├── model_vlm.py                    # VLM structure
+├── model_vlm.py                    # VLM structure (notorch)
 ├── tokenizer.json
 └── tokenizer_config.json
 ```
