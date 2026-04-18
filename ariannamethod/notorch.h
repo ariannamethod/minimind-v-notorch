@@ -103,8 +103,6 @@ void nt_tensor_print(const nt_tensor* t, const char* name);
 #define NT_OP_SEQ_LAYERNORM  21   // layernorm per position
 #define NT_OP_GELU           22   // GELU activation
 #define NT_OP_GQA_ATTN       23   // grouped-query causal attention
-#define NT_OP_RRPRAM_ATTN    24   // RRPRAM positional attention (x @ Wr, causal)
-#define NT_OP_CONCAT         25   // concatenate two tensors per position
 
 typedef struct {
     nt_tensor* output;          // forward result
@@ -203,6 +201,7 @@ int  nt_tape_record3(nt_tensor* output, int op, int p1, int p2, int p3, float au
 int  nt_tape_record4(nt_tensor* output, int op, int p1, int p2, int p3, float aux, float aux2, float aux3, float aux4);
 int  nt_tape_param(nt_tensor* param);
 void nt_tape_no_decay(int idx);   // mark param as no-decay (embeddings)
+void nt_tape_freeze_param(int param_idx);  // freeze param (Chuck skips it) — for LoRA
 
 // Backward pass
 void nt_tape_backward(int loss_idx);
@@ -347,24 +346,6 @@ int nt_seq_layernorm(int x_idx, int gamma_idx, int beta_idx, int T, int D);
 // GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
 int nt_gelu(int x_idx);
 
-// RRPRAM attention: positional pattern recognition via x @ Wr
-// wr: [nr_heads * n_embd, ctx], x: [T, n_embd], v: [T, nr_heads * head_dim]
-// output: [T, nr_heads * head_dim]
-int nt_rrpram_attention(int wr_idx, int x_idx, int v_idx, int T, int n_embd, int nr_heads, int head_dim);
-
-// Concatenate per-position: out[t] = [a[t], b[t]]. a: [T, D_a], b: [T, D_b] → out: [T, D_a+D_b]
-int nt_concat(int a_idx, int b_idx, int T);
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// BLAS — direct matmul API for inference engines
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// C[m,n] = A[m,k] @ B[n,k]^T  (B stored row-major [n,k])
-void nt_blas_mmT(float *C, const float *A, const float *BT, int m, int k, int n);
-
-// C[m,n] = A[m,k] @ B[k,n]
-void nt_blas_mm(float *C, const float *A, const float *B, int m, int k, int n);
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROFILER — op timing + memory tracking
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -391,7 +372,7 @@ void         nt_profiler_print(void);
 // BPE TOKENIZER — byte-pair encoding for training and inference
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#define NT_BPE_MAX_MERGES 32768
+#define NT_BPE_MAX_MERGES 8192
 #define NT_BPE_MAX_VOCAB  (256 + NT_BPE_MAX_MERGES)
 #define NT_BPE_MAX_TOKEN_LEN 64
 
@@ -478,7 +459,7 @@ void nt_hebbian_step(float* A, float* B, int out_dim, int in_dim, int rank,
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UTILITIES
-// ═════���═════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // Count total parameters across N tensors
 long nt_count_params(nt_tensor** params, int n);

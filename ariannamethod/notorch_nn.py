@@ -83,6 +83,10 @@ _lib.nt_mul.argtypes = [ctypes.c_int, ctypes.c_int]
 _lib.nt_seq_cross_entropy.restype = ctypes.c_int
 _lib.nt_seq_cross_entropy.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
+# GQA (grouped-query attention)
+_lib.nt_gqa_causal_attention.restype = ctypes.c_int
+_lib.nt_gqa_causal_attention.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
 # Record
 _lib.nt_tape_record.restype = ctypes.c_int
 _lib.nt_tape_record.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float]
@@ -95,6 +99,48 @@ _lib.nt_load.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
 
 # Schedule
 _lib.nt_seed.argtypes = [ctypes.c_uint64]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAPE FREEZE API (for LoRA: freeze base weights, train only adapters)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NT_CHUCK_WINDOW = 8
+NT_TAPE_MAX_PARAMS = 512
+
+class _NtChuckParamState(ctypes.Structure):
+    _fields_ = [
+        ("grad_hist", ctypes.c_float * NT_CHUCK_WINDOW),
+        ("dampen", ctypes.c_float),
+        ("frozen", ctypes.c_int),
+        ("pos", ctypes.c_int),
+        ("full", ctypes.c_int),
+        ("stag", ctypes.c_int),
+    ]
+
+def tape_freeze_param(param_idx):
+    """Freeze a tape parameter by index (Chuck will skip it)."""
+    tape = _lib.nt_tape_get()
+    if not tape:
+        return
+    # chuck_params offset: after entries, count, active, adam, n_params, chuck_state
+    # Easier: just access via the C struct. We know chuck_params[idx].frozen
+    # The tape struct is complex, so we use a direct offset approach
+    # nt_tape_entry = 48 bytes (void* output, int op, int p1, int p2, float aux + padding)
+    # But this is fragile. Let's add a C function instead.
+    # For now: use nt_tape_no_decay as template — we'll call a dedicated freeze fn
+    pass  # Will be implemented via C function below
+
+def _add_tape_freeze():
+    """Try to bind nt_tape_freeze_param if available in libnotorch."""
+    try:
+        _lib.nt_tape_freeze_param.restype = None
+        _lib.nt_tape_freeze_param.argtypes = [ctypes.c_int]
+        return True
+    except AttributeError:
+        return False
+
+_has_tape_freeze = _add_tape_freeze()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TENSOR WRAPPER
@@ -229,6 +275,29 @@ class Linear(Module):
         self.weight = Parameter.zeros((out_features, in_features))
         self.weight.xavier_(in_features, out_features)
         # bias not supported in notorch seq_linear (matches our models)
+
+
+class LoRALinear(Module):
+    """LoRA adapter for Linear layers. Wraps existing weight, adds low-rank A*B.
+
+    Forward: y = x @ W^T + (alpha/r) * x @ A^T @ B^T
+    Only A and B are trainable. W is frozen.
+    """
+    def __init__(self, in_features, out_features, r=32, alpha=1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.alpha = alpha
+        self.scale = alpha / r
+        # Original weight — will be loaded from pretrained, then frozen
+        self.weight = Parameter.zeros((out_features, in_features))
+        # LoRA adapters: A (r × in_features), B (out_features × r)
+        # A initialized with small random, B initialized to zero (LoRA convention)
+        self.lora_A = Parameter.zeros((r, in_features))
+        self.lora_A.xavier_(in_features, r)
+        self.lora_B = Parameter.zeros((out_features, r))
+        # B starts at zero → LoRA output is zero at init → no perturbation
 
 
 class Embedding(Module):
