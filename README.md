@@ -176,7 +176,7 @@ logits = model.forward_inference(tokens, image_path="path/to/image.jpg")
 
 ## License
 
-This project is licensed under the Apache-2.0 License. See [LICENSE](LICENSE) for details.
+This project is licensed under the GNU GPLv3 License. See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
